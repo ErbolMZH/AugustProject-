@@ -1,0 +1,278 @@
+// 📌 2. Создание запроса по инциденту
+func AFCreateInquiryHandler(c echo.Context) error {
+	incidentID := c.Param("id")
+	if incidentID == "" {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "Incident ID is required"})
+	}
+
+	// Чтение полей из multipart/form-data
+	targetBIN := strings.TrimSpace(c.FormValue("target_bin"))
+	description := strings.TrimSpace(c.FormValue("description"))
+	inquiryType := strings.TrimSpace(c.FormValue("type"))
+	if inquiryType == "" {
+		inquiryType = "MANUAL"
+	}
+
+	if targetBIN == "" {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "Необходимо выбрать целевую организацию"})
+	}
+	if description == "" {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "Описание запроса не может быть пустым"})
+	}
+
+	// Чтение прикрепленных файлов (PDF, PNG, JPG)
+	var attachments []FileAttachment
+	form, err := c.MultipartForm()
+
+	if err == nil && form != nil && form.File != nil {
+		files, exists := form.File["files"]
+		if exists && len(files) > 0 {
+			allowedExts := map[string]bool{
+				".png":  true,
+				".jpg":  true,
+				".jpeg": true,
+				".pdf":  true,
+			}
+			const maxFileSize = 10 * 1024 * 1024 // 10MB
+
+			for _, fileHeader := range files {
+				if fileHeader.Size > maxFileSize {
+					return c.JSON(http.StatusBadRequest, echo.Map{
+						"error": fmt.Sprintf("Файл %s превышает предел в 10MB", fileHeader.Filename),
+					})
+				}
+
+				ext := strings.ToLower(filepath.Ext(fileHeader.Filename))
+				if !allowedExts[ext] {
+					return c.JSON(http.StatusBadRequest, echo.Map{
+						"error": fmt.Sprintf("Формат %s недопустим. Разрешены: PDF, PNG, JPG", ext),
+					})
+				}
+
+				src, err := fileHeader.Open()
+				if err != nil {
+					return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Ошибка при открытии файла"})
+				}
+
+				fileBytes, err := io.ReadAll(src)
+				src.Close()
+				if err != nil {
+					return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Ошибка при чтении файла"})
+				}
+
+				attachments = append(attachments, FileAttachment{
+					FileName:    fileHeader.Filename,
+					FileContent: base64.StdEncoding.EncodeToString(fileBytes),
+				})
+			}
+		}
+	}
+
+	// Проверка и авторизация
+	authData, _ := model.AFGetAuthStruct()
+	if int(time.Since(authData.CreatedAt).Seconds()) >= authData.RefreshExpiresIn {
+		var err error
+		authData, _, err = model.AFAuth("create_inquiry token expired")
+		if err != nil {
+			logger.Log("ERROR", "inquiry_handler", incidentID, "AFAuth fiasco", err)
+			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Authentication failed"})
+		}
+	}
+	model.AFGlobalAuthData = authData
+
+	// Формирование Payload
+	additionalData := map[string]interface{}{
+		"receiver_bin": targetBIN,
+		"description":  description,
+	}
+
+	if len(attachments) > 0 {
+		additionalData["attachments"] = attachments
+	}
+
+	reqPayload := ExternalInquiryPayload{
+		BIN:            SenderBIN,
+		Type:           inquiryType,
+		Subject:        "Запрос информации по инциденту",
+		AdditionalData: additionalData,
+	}
+
+	jsonPayload, err := json.Marshal(reqPayload)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Failed to prepare payload"})
+	}
+
+	// Отправка POST
+	baseURL := strings.TrimRight(comps.Config.AF_APIURL, "/")
+	targetURL := fmt.Sprintf("%s/external/v1/incidents/%s/inquiries", baseURL, incidentID)
+
+	body, status, err := sendPostInquiry(targetURL, jsonPayload, authData.AccessToken)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Failed to connect to external service"})
+	}
+
+	if status == http.StatusUnauthorized {
+		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "Unauthorized in external service"})
+	}
+
+	// Сохранение в Postgres
+	if status >= 200 && status < 300 {
+		if errRaw := SaveCreateInquiryRawTarget(reqPayload, body, status, incidentID); errRaw != nil {
+			logger.Log("ERROR", "inquiry_handler", incidentID, "Save DB fiasco", errRaw)
+			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Failed to save inquiry data"})
+		}
+
+		return c.JSON(http.StatusOK, echo.Map{
+			"message": "Inquiry created successfully",
+			"status":  status,
+		})
+	}
+
+	return c.JSON(status, echo.Map{
+		"error":   "External service error",
+		"status":  status,
+		"details": string(body),
+	})
+}
+
+
+
+
+
+
+
+methods: {
+  // Вызов при открытии модального окна добавления запроса
+  async openInquiryModal() {
+    this.showInquiryModal = true;
+    this.inquiryError = null;
+    this.newInquiry = {
+      type: 'MANUAL',
+      targetBin: null,
+      description: ''
+    };
+    this.files = [];
+
+    // Загружаем список связанных БИН/организаций для дропдауна
+    try {
+      const res = await axios.get(`/incidents/${this.incident_id}/related-orgs`);
+      if (res.status === 200) {
+        this.relatedOrgs = res.data;
+      }
+    } catch (err) {
+      console.error("Ошибка загрузки связанных организаций:", err);
+    }
+  },
+
+  // Выбор файлов пользователем
+  handleFileUpload(event) {
+    this.files = Array.from(event.target.files);
+  },
+
+  // Отправка запроса на бэкенд
+  async submitInquiry() {
+    if (!this.newInquiry.targetBin) {
+      this.inquiryError = "Выберите целевую организацию (БИН)";
+      return;
+    }
+    if (!this.newInquiry.description.trim()) {
+      this.inquiryError = "Введите описание запроса";
+      return;
+    }
+
+    this.isSubmittingInquiry = true;
+    this.inquiryError = null;
+
+    try {
+      const formData = new FormData();
+      formData.append("target_bin", this.newInquiry.targetBin);
+      formData.append("description", this.newInquiry.description);
+      formData.append("type", this.newInquiry.type || "MANUAL");
+
+      // Прикрепляем файлы
+      if (this.files && this.files.length > 0) {
+        this.files.forEach(file => {
+          formData.append("files", file);
+        });
+      }
+
+      const response = await axios.post(
+        `/incidents/${this.incident_id}/inquiries`,
+        formData,
+        {
+          headers: {
+            "Content-Type": "multipart/form-data"
+          }
+        }
+      );
+
+      if (response.status === 200) {
+        this.showInquiryModal = false;
+        // Перезагружаем данные инцидента, чтобы увидеть новый запрос в таблице
+        this.fetchIncidentInfo(this.incident_id);
+      }
+    } catch (error) {
+      this.inquiryError = error.response?.data?.error || "Ошибка при отправке запроса";
+    } finally {
+      this.isSubmittingInquiry = false;
+    }
+  },
+
+  // ... остальные существующие методы (fetchIncidentInfo, toLocaleDate, и т.д.)
+}
+
+
+
+
+
+
+
+<!-- Кнопка открытия -->
+<button class="btn btn-primary" @click="openInquiryModal()">
+  + Добавить запрос
+</button>
+
+<!-- Модальное окно -->
+<div v-if="showInquiryModal" class="modal-overlay">
+  <div class="modal-content">
+    <h3>Создать запрос по инциденту</h3>
+
+    <div v-if="inquiryError" class="alert alert-danger">
+      {{ inquiryError }}
+    </div>
+
+    <div class="form-group mt10">
+      <label>Целевая организация (БИН):</label>
+      <select v-model="newInquiry.targetBin" class="form-control">
+        <option :value="null" disabled>Выберите организацию</option>
+        <option v-for="org in relatedOrgs" :key="org.code" :value="org.code">
+          {{ org.organization_name }} (БИН: {{ org.code }})
+        </option>
+      </select>
+    </div>
+
+    <div class="form-group mt10">
+      <label>Тип запроса:</label>
+      <input type="text" v-model="newInquiry.type" class="form-control" placeholder="MANUAL" />
+    </div>
+
+    <div class="form-group mt10">
+      <label>Описание запроса:</label>
+      <textarea v-model="newInquiry.description" class="form-control" rows="4"></textarea>
+    </div>
+
+    <div class="form-group mt10">
+      <label>Прикрепить файлы (PDF, PNG, JPG):</label>
+      <input type="file" multiple @change="handleFileUpload" accept=".pdf,.png,.jpg,.jpeg" />
+    </div>
+
+    <div class="modal-actions mt15">
+      <button class="btn btn-secondary" @click="showInquiryModal = false" :disabled="isSubmittingInquiry">
+        Отмена
+      </button>
+      <button class="btn btn-primary" @click="submitInquiry" :disabled="isSubmittingInquiry">
+        {{ isSubmittingInquiry ? 'Отправка...' : 'Отправить' }}
+      </button>
+    </div>
+  </div>
+</div>
