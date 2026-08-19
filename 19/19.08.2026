@@ -1,0 +1,87 @@
+import (
+	"crypto/md5"
+	"encoding/hex"
+	// ... остальные импорты
+)
+
+// Структура для файла, если внешний сервис просит md5
+type FileAttachmentRef struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name"`
+	MD5      string `json:"md5,omitempty"` // Хеш файла (если нужен внешнему сервису)
+}
+
+// Функция для вычисления MD5 хеша файла
+func calculateMD5(fileHeader *multipart.FileHeader) (string, error) {
+	src, err := fileHeader.Open()
+	if err != nil {
+		return "", err
+	}
+	defer src.Close()
+
+	hash := md5.New()
+	if _, err := io.Copy(hash, src); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+
+// Чтение и загрузка прикрепленных файлов во внешний сервис
+	var attachments []FileAttachmentRef
+	form, err := c.MultipartForm()
+
+	if err == nil && form != nil && form.File != nil {
+		var files []*multipart.FileHeader
+		if f, ok := form.File["files"]; ok {
+			files = f
+		} else if f, ok := form.File["files[]"]; ok {
+			files = f
+		}
+
+		if len(files) > 0 {
+			allowedExts := map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".pdf": true}
+			const maxFileSize = 10 * 1024 * 1024
+
+			uploadFileURL := fmt.Sprintf("%s/external/v1/files?target=INCIDENT_FILES", baseURL)
+
+			for _, fileHeader := range files {
+				if fileHeader.Size > maxFileSize {
+					return c.JSON(http.StatusBadRequest, echo.Map{
+						"error": fmt.Sprintf("Файл %s превышает предел в 10MB", fileHeader.Filename),
+					})
+				}
+
+				ext := strings.ToLower(filepath.Ext(fileHeader.Filename))
+				if !allowedExts[ext] {
+					return c.JSON(http.StatusBadRequest, echo.Map{
+						"error": fmt.Sprintf("Формат %s недопустим. Разрешены: PDF, PNG, JPG", ext),
+					})
+				}
+
+				// 1. Вычисляем MD5 хеш (если спецификация требует md5 файла)
+				fileMD5, err := calculateMD5(fileHeader)
+				if err != nil {
+					fmt.Printf("[MD5 ERROR] Failed to compute MD5 for %s: %v\n", fileHeader.Filename, err)
+				}
+
+				// 2. Загружаем файл во внешний сервис
+				fileID, err := uploadFileToExternal(uploadFileURL, fileHeader, authData.AccessToken)
+				if err != nil {
+					fmt.Printf("[UPLOAD ERROR] File: %s, Err: %v\n", fileHeader.Filename, err)
+					logger.Log("ERROR", "inquiry_handler", incidentID, "File upload failed", err)
+					return c.JSON(http.StatusInternalServerError, echo.Map{
+						"error": fmt.Sprintf("Ошибка загрузки файла во внешний сервис: %v", err),
+					})
+				}
+
+				// 3. Добавляем данные о файле (включая ID и MD5)
+				attachments = append(attachments, FileAttachmentRef{
+					FileID:   fileID,
+					FileName: fileHeader.Filename,
+					MD5:      fileMD5,
+				})
+			}
+		}
+	}
