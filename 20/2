@@ -1,0 +1,143 @@
+CREATE OR REPLACE PROCEDURE public.p_prc_inquiries_json3()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    WITH updated_rows AS (
+        -- 1. Меняем статус на 3. Если incident_id в таблице уже UUID, кастовать его не нужно!
+        UPDATE inquiries_json
+        SET status = 3
+        WHERE status = 1
+        RETURNING json_, incident_id
+    ),
+    parsed_data AS (
+        -- 2. Безопасно разбираем JSON
+        SELECT 
+            -- Берём incident_id из таблицы. Если там NULL — пробуем вытащить из JSONB и приводим к UUID
+            COALESCE(
+                ur.incident_id,
+                NULLIF(ur.json_ ->> 'incident_id', '')::UUID
+            ) AS incident_id,
+
+            -- Извлекаем inquiry_id с проверкой на null/пустую строку
+            NULLIF(
+                COALESCE(
+                    item.value -> 'inquiry' ->> 'id',
+                    item.value ->> 'id'
+                ), ''
+            )::UUID AS inquiry_id,
+            
+            COALESCE(
+                item.value -> 'inquiry' -> 'sender' ->> 'bin',
+                item.value ->> 'bin'
+            ) AS sender_bin,
+            
+            item.value -> 'inquiry' -> 'sender' ->> 'email' AS sender_email,
+            
+            COALESCE(
+                (item.value -> 'inquiry' ->> 'isUnread')::BOOLEAN,
+                false
+            ) AS is_unread,
+            
+            item.value -> 'inquiry' -> 'receiver' ->> 'bin' AS receiver_bin,
+            
+            COALESCE(
+                NULLIF(item.value -> 'inquiry' ->> 'createdDate', '')::TIMESTAMP WITH TIME ZONE,
+                NOW()
+            ) AS created_date,
+            
+            COALESCE(
+                item.value -> 'inquiry' -> 'additionalData' ->> 'description',
+                item.value -> 'additionalData' ->> 'description'
+            ) AS description,
+            
+            COALESCE(
+                item.value -> 'inquiry' -> 'additionalData' -> 'attachments',
+                item.value -> 'additionalData' -> 'attachments'
+            ) AS attachments,
+            
+            COALESCE(
+                NULLIF(batch.value ->> 'createdDate', '')::DATE,
+                CURRENT_DATE
+            ) AS batch_created_date,
+            
+            ROW_NUMBER() OVER (
+                PARTITION BY COALESCE(
+                    NULLIF(item.value -> 'inquiry' ->> 'id', ''),
+                    NULLIF(item.value ->> 'id', '')
+                )
+                ORDER BY COALESCE(
+                    NULLIF(item.value -> 'inquiry' ->> 'createdDate', '')::TIMESTAMP WITH TIME ZONE,
+                    NOW()
+                ) DESC
+            ) as rn
+        FROM 
+            updated_rows ur
+        CROSS JOIN LATERAL jsonb_array_elements(
+            CASE 
+                WHEN jsonb_typeof(ur.json_) = 'array' THEN ur.json_
+                ELSE jsonb_build_array(ur.json_)
+            END
+        ) AS batch
+        CROSS JOIN LATERAL jsonb_array_elements(
+            CASE 
+                WHEN jsonb_typeof(batch.value -> 'items') = 'array' THEN batch.value -> 'items'
+                ELSE jsonb_build_array(batch.value)
+            END
+        ) AS item
+    ),
+    inserted_inquiries AS (
+        -- 3. Вставляем разобранные данные в таблицу inquiries
+        INSERT INTO inquiries (
+            inquiry_id, incident_id, sender_bin, sender_email, is_unread, 
+            receiver_bin, created_date, description, attachments, batch_created_date
+        )
+        SELECT 
+            inquiry_id, incident_id, sender_bin, sender_email, is_unread, 
+            receiver_bin, created_date, description, attachments, batch_created_date
+        FROM parsed_data
+        WHERE rn = 1 AND inquiry_id IS NOT NULL
+        ON CONFLICT (inquiry_id) DO UPDATE SET
+            incident_id = EXCLUDED.incident_id,
+            sender_bin = EXCLUDED.sender_bin,
+            sender_email = EXCLUDED.sender_email,
+            is_unread = EXCLUDED.is_unread,
+            receiver_bin = EXCLUDED.receiver_bin,
+            created_date = EXCLUDED.created_date,
+            description = EXCLUDED.description,
+            attachments = EXCLUDED.attachments,
+            batch_created_date = EXCLUDED.batch_created_date,
+            dt_ins = NOW()
+        RETURNING inquiry_id, incident_id, attachments
+    )
+    -- 4. Распаковка вложений в incidents_request_files
+    INSERT INTO public.incidents_request_files (
+        incident_id,
+        inq_id,
+        files_id,
+        is_deleted,
+        name
+    )
+    SELECT 
+        ii.incident_id,
+        ii.inquiry_id,
+        NULLIF(file_elem.value ->> 'id', '')::UUID AS files_id,
+        COALESCE((file_elem.value ->> 'isDeleted')::BOOLEAN, false) AS is_deleted,
+        file_elem.value ->> 'name' AS name
+    FROM inserted_inquiries ii
+    CROSS JOIN LATERAL jsonb_array_elements(
+        CASE 
+            WHEN jsonb_typeof(ii.attachments) = 'array' THEN ii.attachments
+            ELSE '[]'::jsonb
+        END
+    ) AS att_elem
+    CROSS JOIN LATERAL jsonb_array_elements(
+        CASE 
+            WHEN jsonb_typeof(att_elem.value -> 'files') = 'array' THEN att_elem.value -> 'files'
+            ELSE '[]'::jsonb
+        END
+    ) AS file_elem
+    WHERE ii.attachments IS NOT NULL 
+      AND NULLIF(file_elem.value ->> 'id', '') IS NOT NULL;
+
+END;
+$$;
