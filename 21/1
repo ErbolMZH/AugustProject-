@@ -1,0 +1,121 @@
+CREATE OR REPLACE PROCEDURE public.p_prc_inquiries_json()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_ids integer[];
+BEGIN
+    -- Шаг 1: помечаем строки как "в обработке" (статус 3) и запоминаем их id
+    UPDATE inquiries_json
+    SET status = 3
+    WHERE status = 1
+    RETURNING id INTO v_ids;
+
+    -- Если ничего не выбрано - выходим
+    IF v_ids IS NULL OR array_length(v_ids, 1) IS NULL THEN
+        RETURN;
+    END IF;
+
+    -- Шаг 2: пробуем разобрать и вставить, ловим ошибку целиком
+    BEGIN
+        WITH parsed_data AS (
+            SELECT 
+                COALESCE(ij.incident_id, ij.json_ ->> 'incident_id') AS incident_id,
+                CASE 
+                    WHEN (item.value -> 'inquiry' ->> 'id') IS NOT NULL AND (item.value -> 'inquiry' ->> 'id') != '' 
+                        THEN (item.value -> 'inquiry' ->> 'id')::UUID
+                    WHEN (item.value ->> 'id') IS NOT NULL AND (item.value ->> 'id') != '' 
+                        THEN (item.value ->> 'id')::UUID
+                    ELSE NULL
+                END AS inquiry_id,
+                COALESCE(
+                    item.value -> 'inquiry' -> 'sender' ->> 'bin',
+                    item.value ->> 'bin'
+                ) AS sender_bin,
+                item.value -> 'inquiry' -> 'sender' ->> 'email' AS sender_email,
+                COALESCE((item.value -> 'inquiry' ->> 'isUnread')::BOOLEAN, false) AS is_unread,
+                item.value -> 'inquiry' -> 'receiver' ->> 'bin' AS receiver_bin,
+                CASE 
+                    WHEN (item.value -> 'inquiry' ->> 'createdDate') IS NOT NULL AND (item.value -> 'inquiry' ->> 'createdDate') != ''
+                        THEN (item.value -> 'inquiry' ->> 'createdDate')::TIMESTAMP WITH TIME ZONE
+                    ELSE NOW()
+                END AS created_date,
+                COALESCE(
+                    item.value -> 'inquiry' -> 'additionalData' ->> 'description',
+                    item.value -> 'additionalData' ->> 'description'
+                ) AS description,
+                COALESCE(
+                    item.value -> 'inquiry' -> 'additionalData' -> 'attachments',
+                    item.value -> 'additionalData' -> 'attachments'
+                ) AS attachments,
+                CASE 
+                    WHEN (batch.value ->> 'createdDate') IS NOT NULL AND (batch.value ->> 'createdDate') != ''
+                        THEN (batch.value ->> 'createdDate')::DATE
+                    ELSE CURRENT_DATE
+                END AS batch_created_date,
+                ROW_NUMBER() OVER (
+                    PARTITION BY COALESCE(item.value -> 'inquiry' ->> 'id', item.value ->> 'id')
+                    ORDER BY NOW() DESC
+                ) as rn
+            FROM inquiries_json ij
+            CROSS JOIN LATERAL jsonb_array_elements(
+                CASE WHEN jsonb_typeof(ij.json_) = 'array' THEN ij.json_ ELSE jsonb_build_array(ij.json_) END
+            ) AS batch
+            CROSS JOIN LATERAL jsonb_array_elements(
+                CASE WHEN jsonb_typeof(batch.value -> 'items') = 'array' THEN batch.value -> 'items' ELSE jsonb_build_array(batch.value) END
+            ) AS item
+            WHERE ij.id = ANY(v_ids)
+        ),
+        inserted_inquiries AS (
+            INSERT INTO inquiries (
+                inquiry_id, incident_id, sender_bin, sender_email, is_unread, 
+                receiver_bin, created_date, description, attachments, batch_created_date
+            )
+            SELECT 
+                inquiry_id, incident_id, sender_bin, sender_email, is_unread, 
+                receiver_bin, created_date, description, attachments, batch_created_date
+            FROM parsed_data
+            WHERE rn = 1 AND inquiry_id IS NOT NULL
+            ON CONFLICT (inquiry_id) DO UPDATE SET
+                incident_id = EXCLUDED.incident_id,
+                sender_bin = EXCLUDED.sender_bin,
+                sender_email = EXCLUDED.sender_email,
+                is_unread = EXCLUDED.is_unread,
+                receiver_bin = EXCLUDED.receiver_bin,
+                created_date = EXCLUDED.created_date,
+                description = EXCLUDED.description,
+                attachments = EXCLUDED.attachments,
+                batch_created_date = EXCLUDED.batch_created_date,
+                dt_ins = NOW()
+            RETURNING inquiry_id, incident_id, attachments
+        )
+        INSERT INTO public.incidents_request_files (
+            incident_id, inq_id, files_id, is_deleted, name
+        )
+        SELECT 
+            NULLIF(ii.incident_id, '')::UUID,
+            ii.inquiry_id,
+            (file_elem.value ->> 'id')::UUID,
+            COALESCE((file_elem.value ->> 'isDeleted')::BOOLEAN, false),
+            file_elem.value ->> 'name'
+        FROM inserted_inquiries ii
+        CROSS JOIN LATERAL jsonb_array_elements(
+            CASE WHEN jsonb_typeof(ii.attachments) = 'array' THEN ii.attachments ELSE '[]'::jsonb END
+        ) AS att_elem
+        CROSS JOIN LATERAL jsonb_array_elements(
+            CASE WHEN jsonb_typeof(att_elem.value -> 'files') = 'array' THEN att_elem.value -> 'files' ELSE '[]'::jsonb END
+        ) AS file_elem
+        WHERE ii.attachments IS NOT NULL 
+          AND (file_elem.value ->> 'id') IS NOT NULL 
+          AND (file_elem.value ->> 'id') != '';
+
+    EXCEPTION WHEN OTHERS THEN
+        -- Шаг 3: если разбор/вставка не удались - помечаем строки статусом ошибки (2)
+        UPDATE inquiries_json
+        SET status = 2
+        WHERE id = ANY(v_ids);
+
+        RAISE WARNING 'Ошибка разбора inquiries_json (ids: %): %', v_ids, SQLERRM;
+    END;
+
+END;
+$$;
