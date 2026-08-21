@@ -1,0 +1,68 @@
+package main
+
+import (
+	"fmt"
+	"time"
+
+	"your_project/comps"
+	"your_project/logger"
+	"your_project/model"
+)
+
+// FetchAndSyncInquiries проверяет токен, запрашивает инциденты из АФЦ и вызывает InsertInquiriesRawTarget
+func FetchAndSyncInquiries(incidentID string) error {
+	if incidentID == "" {
+		logger.Log("WARN", "FetchAndSyncInquiries", "NULL", "incidentID is empty", nil)
+		return fmt.Errorf("incidentID cannot be empty")
+	}
+
+	// 1. Проверяем и обновляем авторизационный токен
+	authData, _ := model.AFGetAuthStruct()
+	secAfterTokenCreation := int(time.Since(authData.CreatedAt).Seconds())
+
+	if secAfterTokenCreation >= authData.RefreshExpiresIn {
+		var err error
+		authData, _, err = model.AFAuth("FetchAndSyncInquiries token expired")
+		if err != nil {
+			logger.Log("ERROR", "FetchAndSyncInquiries", incidentID, fmt.Sprintf("AFAuth fiasco: %s", err), err)
+			return fmt.Errorf("AFAuth fiasco: %w", err)
+		}
+	}
+	model.AFGlobalAuthData = authData
+
+	// 2. Делаем GET-запрос к АФЦ
+	body, status, err := model.AFRequestPlain(
+		"GET",
+		comps.Config.AF.APIURL+`/external/v1/incidents/`+incidentID+`/inquiries`,
+		`AFIncidents`,
+		authData.AccessToken,
+	)
+
+	if err != nil {
+		logger.Log("ERROR", "FetchAndSyncInquiries", incidentID, fmt.Sprintf("AFRequestPlain fiasco: %s", err), err)
+		return fmt.Errorf("AFRequestPlain fiasco: %w", err)
+	}
+
+	if status == 401 {
+		logger.Log("ERROR", "FetchAndSyncInquiries", incidentID, "AFRequestPlain 401 Unauthorized", nil)
+		return fmt.Errorf("AFRequestPlain returned 401 Unauthorized")
+	}
+
+	// 3. Если статус корректный и тело не пустое — сохраняем и разбираем
+	if status != 404 && status != 403 {
+		if len(body) > 0 {
+			logger.Log("INFO", "FetchAndSyncInquiries", incidentID, "Starting InsertInquiriesRawTarget...", nil)
+			
+			if errRaw := InsertInquiriesRawTarget(body, 1, incidentID); errRaw != nil {
+				logger.Log("ERROR", "FetchAndSyncInquiries", incidentID, fmt.Sprintf("InsertInquiriesRawTarget fiasco: %s", errRaw), errRaw)
+				return fmt.Errorf("InsertInquiriesRawTarget fiasco: %w", errRaw)
+			}
+			
+			logger.Log("INFO", "FetchAndSyncInquiries", incidentID, "Successfully synced raw inquiries!", nil)
+		} else {
+			logger.Log("INFO", "FetchAndSyncInquiries", incidentID, fmt.Sprintf("Empty body returned, status = %d", status), nil)
+		}
+	}
+
+	return nil
+}
