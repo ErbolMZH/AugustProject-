@@ -38,6 +38,39 @@ func AFDownloadFileHandler(c echo.Context) error {
 	return c.Blob(http.StatusOK, contentType, fileBytes)
 }
 
+func downloadFileFromExternal(targetURL string, token string) ([]byte, string, string, error) {
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		return nil, "", "", err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, "", "", fmt.Errorf("external download failed with status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	fileBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to read downloaded file body: %w", err)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	contentDisposition := resp.Header.Get("Content-Disposition")
+
+	return fileBytes, contentType, contentDisposition, nil
+}
+
+
+
 
 
 methods: {
@@ -60,6 +93,9 @@ methods: {
 
     return files;
   },
+
+
+  
 
   // Метод скачивания файла
   async downloadAttachment(file) {
