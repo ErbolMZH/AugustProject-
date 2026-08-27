@@ -29,3 +29,45 @@ const additionalData = inquiry.additionalData || inquiry.additional_data;
             });
         }
     }
+
+
+
+
+
+
+
+    getInquiryFiles(inquiry) {
+    if (!inquiry) return [];
+
+    let attachments = inquiry.attachments;
+
+    // Если attachments пришел как заэкранированная строка (string), парсим его в JSON
+    if (typeof attachments === 'string') {
+        try {
+            attachments = JSON.parse(attachments);
+        } catch (e) {
+            console.error("Ошибка парсинга attachments:", e);
+            return [];
+        }
+    }
+
+    const files = [];
+
+    // Проходим по распарсенному массиву attachments
+    if (Array.isArray(attachments)) {
+        attachments.forEach(att => {
+            if (att && att.files && Array.isArray(att.files)) {
+                att.files.forEach(f => {
+                    if (f && f.id) {
+                        files.push({
+                            id: f.id,
+                            name: f.name || 'document.png'
+                        });
+                    }
+                });
+            }
+        });
+    }
+
+    return files;
+}
