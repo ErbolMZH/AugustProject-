@@ -1,0 +1,31 @@
+const additionalData = inquiry.additionalData || inquiry.additional_data;
+    
+    if (additionalData && additionalData.attachments && Array.isArray(additionalData.attachments)) {
+        additionalData.attachments.forEach(att => {
+            if (att.files && Array.isArray(att.files)) {
+                att.files.forEach(f => {
+                    if (f && (f.id || f.ID)) {
+                        files.push({
+                            id: f.id || f.ID,
+                            name: f.name || f.Name || f.file_name || 'Прикрепленный файл'
+                        });
+                    }
+                });
+            }
+        });
+    }
+
+    // 2. Если файлы уже лежат плоским массивом на верхнем уровне inquiry (files или Attachments)
+    if (files.length === 0) {
+        const rawFiles = inquiry.files || inquiry.Files || inquiry.attachments;
+        if (Array.isArray(rawFiles)) {
+            rawFiles.forEach(f => {
+                if (f && (f.id || f.ID || f.file_id)) {
+                    files.push({
+                        id: f.id || f.ID || f.file_id,
+                        name: f.name || f.Name || f.file_name || 'Прикрепленный файл'
+                    });
+                }
+            });
+        }
+    }
