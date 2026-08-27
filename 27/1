@@ -1,0 +1,114 @@
+// GET /api/v1/inquiries/files/download?id=***
+func AFDownloadFileHandler(c echo.Context) error {
+	fileID := strings.TrimSpace(c.QueryParam("id"))
+	if fileID == "" {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "File ID is required"})
+	}
+
+	// 1. Проверка токена
+	authData, _ := model.AFGetAuthStruct()
+	if int(time.Since(authData.CreatedAt).Seconds()) >= authData.RefreshExpiresIn {
+		var err error
+		authData, _, err = model.AFAuth("download_file token expired")
+		if err != nil {
+			logger.Log("ERROR", "download_file_handler", fileID, "AFAuth fiasco", err)
+			return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Authentication failed"})
+		}
+	}
+	model.AFGlobalAuthData = authData
+
+	// 2. Вызываем эндпоинт внешнего сервиса
+	baseURL := strings.TrimRight(comps.Config.AF.APIURL, "/")
+	downloadURL := fmt.Sprintf("%s/external/v1/files/download?id=%s", baseURL, url.QueryEscape(fileID))
+
+	fileBytes, contentType, contentDisposition, err := downloadFileFromExternal(downloadURL, authData.AccessToken)
+	if err != nil {
+		logger.Log("ERROR", "download_file_handler", fileID, "Failed to download file from AF", err)
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "Failed to retrieve file from external service"})
+	}
+
+	// 3. Отдаем заголовки и Blob в ответ
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	if contentDisposition != "" {
+		c.Response().Header().Set("Content-Disposition", contentDisposition)
+	}
+
+	return c.Blob(http.StatusOK, contentType, fileBytes)
+}
+
+
+
+methods: {
+  // Метод для извлечения плоского массива файлов из inquiry
+  getInquiryFiles(inquiry) {
+    const files = [];
+
+    // Если у вас структура совпадает с ExternalInquiryPayload (additionalData.attachments[].files[])
+    if (inquiry.additional_data && inquiry.additional_data.attachments) {
+      inquiry.additional_data.attachments.forEach(attachment => {
+        if (attachment.files && Array.isArray(attachment.files)) {
+          files.push(...attachment.files);
+        }
+      });
+    } 
+    // Запасной вариант, если файлы уже приходят плоским массивом в inquiry.files
+    else if (inquiry.files && Array.isArray(inquiry.files)) {
+      return inquiry.files;
+    }
+
+    return files;
+  },
+
+  // Метод скачивания файла
+  async downloadAttachment(file) {
+    if (!file || !file.id) return;
+
+    try {
+      // Запрос к бэкенд-эндпоинту скачивания
+      const response = await axios({
+        url: `/api/v1/inquiries/files/download?id=${encodeURIComponent(file.id)}`,
+        method: 'GET',
+        responseType: 'blob' // Обязательно для бинарных файлов (pdf, images и т.д.)
+      });
+
+      // Создаем временную ссылку для скачивания файла в браузере
+      const blob = new Blob([response.data], { 
+        type: response.headers['content-type'] || 'application/octet-stream' 
+      });
+      const downloadUrl = window.URL.createObjectURL(blob);
+      
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.setAttribute('download', file.name || `file_${file.id}`);
+      document.body.appendChild(link);
+      link.click();
+
+      // Очистка памяти
+      link.remove();
+      window.URL.revokeObjectURL(downloadUrl);
+    } catch (error) {
+      console.error('Ошибка скачивания файла:', error);
+      alert('Не удалось скачать файл. Попробуйте позже.');
+    }
+  }
+}
+
+
+
+<td>
+                                <div v-if="getInquiryFiles(inquiry).length > 0" class="files-container">
+                                    <button 
+                                        v-for="file in getInquiryFiles(inquiry)" 
+                                        :key="file.id"
+                                        class="btn-file-download"
+                                        :title="'Скачать ' + file.name"
+                                        @click="downloadAttachment(file)"
+                                    >
+                                        <i class="icon-file">📎</i>
+                                        <span class="file-name">{{ file.name }}</span>
+                                    </button>
+                                </div>
+                                <span v-else class="text-muted">-</span>
+                            </td>
